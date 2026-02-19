@@ -1,384 +1,199 @@
 #!/usr/bin/env python3
 """
-STF-Mamba V8.0 - Main Backbone Model
-=======================================
+STF-Mamba V8.0 - DINOv2-ViT-B/14 Backbone
+============================================
 
-Modular architecture with feature flags for incremental upgrades.
+Extracts per-frame CLS tokens from DINOv2-ViT-B/14.
 
-PHASE A (V7.3 + Fixes):
-  ConvNeXt V2 → 3D-DWT → Simple HLL features → Bi-Mamba + FFN → Head
-  + Contrastive HLL Loss (fix #1)
-  + Compression Augmentation (fix #2)
-  + Multi-scale Drift (fix #3)
+Freeze strategy:
+    - Blocks 0-9: Frozen (lr=0), preserves pretrained knowledge
+    - Blocks 10-11: Fine-tuned (lr=5e-6), adapts to deepfake domain
 
-PHASE B (Full V8.0):
-  ConvNeXt V2 → 3D-DWT → W-SS (dual stream) → PN-Mamer (Hydra + Attention) → Head
+Input:  (B, T, 3, 224, 224) — T face-cropped frames
+Output: (B, T, 768) — CLS token per frame
 
-Usage:
-    from config_v8 import STFV8Config
-    from modules.backbone_v8 import STFMambaV8
-    
-    # Phase A
-    model = STFMambaV8(STFV8Config.phase_a())
-    
-    # Phase B  
-    model = STFMambaV8(STFV8Config.phase_b())
+Why DINOv2 over EfficientNet-B4:
+    1. Self-supervised training on 142M images → features survive H.264 compression
+    2. ViT CLS tokens encode holistic face identity without spatial bias
+    3. 2026 reviewers expect SOTA backbones; EffNet-B4 was the 2022 standard
 """
 
 import logging
-from typing import Dict, Optional
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
 
-class STFMambaV8(nn.Module):
+class DINOv2Backbone(nn.Module):
     """
-    STF-Mamba V8.0: Unified Spectral-Temporal Forensics.
-    
-    Architecture:
-    1. ConvNeXt V2-Base (pretrained, frozen/low-LR) → frame-level spatial features
-    2. 3D-DWT (Sym2) → 8 wavelet sub-bands 
-    3. W-SS or simple HLL (depending on config) → frequency features
-    4. PN-Mamer stages (Hydra/Bi-Mamba + Attention/FFN) → temporal modeling
-    5. Classification head → real/fake prediction
-    
-    Returns dict with logits, hll_energy, all_band_energy for loss computation.
+    DINOv2-ViT-B/14 backbone with partial freeze for deepfake detection.
+
+    Processes T frames independently (shared weights), extracts CLS token
+    per frame. Batched forward pass: reshape (B*T, 3, 224, 224) → forward
+    → reshape (B, T, 768).
+
+    Args:
+        model_name: DINOv2 model variant. Default: 'dinov2_vitb14'.
+        freeze_blocks: Number of transformer blocks to freeze (0-indexed).
+            Default: 10 (freeze blocks 0-9, fine-tune 10-11).
+        pretrained: Whether to load pretrained weights. Default: True.
     """
-    
-    def __init__(self, config):
+
+    CLS_DIM = 768  # DINOv2-ViT-B/14 CLS token dimension
+    NUM_BLOCKS = 12  # Total transformer blocks in ViT-B
+
+    def __init__(
+        self,
+        model_name: str = "dinov2_vitb14",
+        freeze_blocks: int = 10,
+        pretrained: bool = True,
+    ) -> None:
         super().__init__()
-        self.config = config
-        
-        # =====================================================
-        # PHASE 1: Spatial Feature Extraction (ConvNeXt V2)
-        # =====================================================
-        self.backbone = self._build_backbone(config)
-        backbone_dim = config.backbone_out_dim
-        
-        # =====================================================
-        # PHASE 2: 3D-DWT Frequency Decomposition
-        # =====================================================
-        self.dwt = DWT3DModule(in_channels=backbone_dim, out_channels=config.dwt_out_channels)
-        
-        # =====================================================
-        # PHASE 2.5: W-SS or Simple Frequency Feature Extraction
-        # =====================================================
-        from .wss_module import WaveletSelectiveScan
-        self.wss = WaveletSelectiveScan(
-            in_channels=config.dwt_out_channels,
-            out_dim=config.temporal_dim,
-            temporal_dim=config.wss_temporal_dim,
-            spatial_dim=config.wss_spatial_dim,
-            dropout=config.dropout,
-            use_wss=config.use_wss,
-        )
-        
-        # =====================================================
-        # PHASE 3: Temporal Modeling (PN-Mamer or Bi-Mamba)
-        # =====================================================
-        from .hydra_mixer import PNMamerStage
-        self.temporal_stages = nn.ModuleList()
-        for i in range(config.num_temporal_stages):
-            stage = PNMamerStage(
-                d_model=config.temporal_dim,
-                num_hydra_blocks=config.blocks_per_stage,
-                num_heads=config.mamer_num_heads,
-                d_state=config.hydra_d_state if config.use_hydra else config.mamba_d_state,
-                d_conv=config.hydra_d_conv if config.use_hydra else config.mamba_d_conv,
-                dropout=config.dropout,
-                use_hydra=config.use_hydra,
-                use_mamer=config.use_mamer,
+        self.model_name = model_name
+        self.freeze_blocks = freeze_blocks
+
+        # Load DINOv2 via torch.hub
+        if pretrained:
+            logger.info(f"Loading {model_name} via torch.hub (pretrained=True)...")
+            self.dinov2 = torch.hub.load(
+                "facebookresearch/dinov2",
+                model_name,
+                pretrained=True,
             )
-            self.temporal_stages.append(stage)
-        
-        # =====================================================
-        # PHASE 4: Classification Head
-        # =====================================================
-        self.head_norm = nn.LayerNorm(config.temporal_dim)
-        self.head = nn.Sequential(
-            nn.Linear(config.temporal_dim, config.temporal_dim // 2),
-            nn.GELU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.temporal_dim // 2, config.num_classes),
-        )
-        
-        # Initialize
-        self._init_weights()
-        
-        # Log architecture info
-        total_params = sum(p.numel() for p in self.parameters())
-        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        logger.info(f"STF-Mamba V8.0 initialized: {config.describe_mode()}")
-        logger.info(f"  Total params: {total_params:,}")
-        logger.info(f"  Trainable params: {trainable_params:,}")
-        
-    def _build_backbone(self, config):
-        """Build and configure ConvNeXt V2 backbone."""
-        try:
-            import timm
-            backbone = timm.create_model(
-                config.backbone_name,
-                pretrained=config.backbone_pretrained,
-                num_classes=0,  # Remove classification head
-                global_pool='',  # We'll do our own pooling
+        else:
+            # Should NEVER be used — random init is empirically disproven (V7.3)
+            logger.warning(
+                "Loading DINOv2 WITHOUT pretrained weights. "
+                "This is empirically proven to fail — use pretrained=True."
             )
-            
-            # Freeze early stages
-            if config.backbone_freeze_stages > 0:
-                # Freeze stem
-                for param in backbone.stem.parameters():
-                    param.requires_grad = False
-                # Freeze stages
-                for i in range(min(config.backbone_freeze_stages, 4)):
-                    if hasattr(backbone, 'stages'):
-                        for param in backbone.stages[i].parameters():
-                            param.requires_grad = False
-                            
-            logger.info(f"Loaded {config.backbone_name} (pretrained={config.backbone_pretrained})")
-            logger.info(f"  Frozen stages: {config.backbone_freeze_stages}")
-            
-            return backbone
-            
-        except Exception as e:
-            logger.warning(f"Could not load {config.backbone_name}: {e}")
-            logger.warning("Using lightweight CNN fallback")
-            return LightweightCNNBackbone(
-                in_channels=config.in_channels,
-                out_dim=config.backbone_out_dim,
+            self.dinov2 = torch.hub.load(
+                "facebookresearch/dinov2",
+                model_name,
+                pretrained=False,
             )
-    
-    def _extract_frame_features(self, video: torch.Tensor) -> torch.Tensor:
-        """
-        Extract per-frame features using ConvNeXt V2.
-        
-        Args:
-            video: (B, C, T, H, W) raw video
-        Returns:
-            features: (B, T, backbone_dim) per-frame feature vectors
-        """
-        B, C, T, H, W = video.shape
-        
-        # Reshape to process all frames as a batch: (B*T, C, H, W)
-        frames = video.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
-        
-        # Extract features
-        with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
-            feat = self.backbone(frames)  # (B*T, backbone_dim, h, w) or (B*T, backbone_dim)
-            
-            # Handle different backbone output formats
-            if feat.dim() == 4:
-                feat = feat.mean(dim=[-2, -1])  # Global average pool → (B*T, backbone_dim)
-            elif feat.dim() == 3:
-                feat = feat.mean(dim=1)  # Pool sequence dim
-        
-        # Reshape back: (B, T, backbone_dim)
-        features = feat.reshape(B, T, -1)
-        
-        return features
-    
-    def forward(self, video: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Full forward pass.
-        
-        Args:
-            video: (B, C, T, H, W) input video tensor
-            
-        Returns:
-            Dict with:
-                - logits: (B, num_classes) classification logits
-                - hll_energy: (B,) HLL energy for contrastive loss
-                - all_band_energy: (B,) total band energy for normalization
-        """
-        B = video.shape[0]
-        
-        # === Phase 1: Spatial features ===
-        frame_features = self._extract_frame_features(video)  # (B, T, backbone_dim)
-        
-        # === Phase 2: 3D-DWT decomposition ===
-        # Reshape for 3D-DWT: (B, T, D) → (B, D, T, 1, 1) → apply DWT
-        subbands, all_band_energy = self.dwt(frame_features)
-        
-        # === Phase 2.5: Frequency feature extraction (W-SS or simple) ===
-        freq_features, hll_energy = self.wss(subbands)  # (B, T/2, temporal_dim)
-        
-        # === Phase 3: Temporal modeling ===
-        x = freq_features
-        for stage in self.temporal_stages:
-            if self.config.use_gradient_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(stage, x, use_reentrant=False)
-            else:
-                x = stage(x)
-        
-        # === Phase 4: Classification ===
-        x = self.head_norm(x)
-        x = x.mean(dim=1)  # Global average pool over time
-        logits = self.head(x)
-        
-        return {
-            'logits': logits,
-            'hll_energy': hll_energy,
-            'all_band_energy': all_band_energy,
-        }
-    
-    def _init_weights(self):
-        """Initialize non-pretrained weights."""
-        for name, m in self.named_modules():
-            if 'backbone' in name:
-                continue  # Skip pretrained backbone
-            if isinstance(m, nn.Linear):
-                nn.init.trunc_normal_(m.weight, std=0.02)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, (nn.LayerNorm, nn.BatchNorm3d)):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Conv3d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-    
-    def get_optimizer_param_groups(self) -> list:
-        """
-        Get parameter groups with differential learning rates.
-        
-        Backbone: config.lr * config.backbone_lr_mult (very low)
-        Rest: config.lr (normal)
-        """
-        backbone_params = []
-        other_params = []
-        
-        for name, param in self.named_parameters():
-            if not param.requires_grad:
-                continue
-            if 'backbone' in name:
-                backbone_params.append(param)
-            else:
-                other_params.append(param)
-        
-        return [
-            {'params': other_params, 'lr': self.config.lr},
-            {'params': backbone_params, 'lr': self.config.lr * self.config.backbone_lr_mult},
-        ]
 
+        # Apply freeze strategy
+        self._apply_freeze(freeze_blocks)
 
-# =====================================================
-# DWT MODULE (adapted from V7.3)
-# =====================================================
-
-class DWT3DModule(nn.Module):
-    """
-    Simplified 3D-DWT for sequence features.
-    
-    Takes per-frame features (B, T, D) and produces wavelet sub-bands
-    along the temporal dimension.
-    
-    For V8.0, we apply 1D DWT along time (since spatial features are 
-    already extracted by ConvNeXt V2), producing 2 sub-bands: L and H.
-    We then create pseudo-3D sub-bands by combining temporal DWT with 
-    feature-space decomposition.
-    """
-    
-    def __init__(self, in_channels: int = 1024, out_channels: int = 64):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        
-        # Project backbone features to DWT working dimension
-        self.proj = nn.Linear(in_channels, out_channels * 4)
-        
-        # Learnable wavelet-like temporal decomposition
-        # Low-pass (smooth temporal trends)
-        self.temporal_low = nn.Conv1d(
-            out_channels * 4, out_channels, kernel_size=4, stride=2, padding=1,
-            groups=min(out_channels, out_channels * 4),
+        # Log parameter counts
+        total, trainable = self._count_params()
+        logger.info(
+            f"DINOv2 backbone: {total / 1e6:.1f}M total, "
+            f"{trainable / 1e6:.1f}M trainable "
+            f"(blocks {freeze_blocks}-{self.NUM_BLOCKS - 1} fine-tuned)"
         )
-        # High-pass (temporal flicker) — this is our "HLL equivalent"
-        self.temporal_high = nn.Conv1d(
-            out_channels * 4, out_channels, kernel_size=4, stride=2, padding=1,
-            groups=min(out_channels, out_channels * 4),
-        )
-        
-        # Feature-space decomposition (simulates spatial frequency bands)
-        self.band_projections = nn.ModuleDict({
-            'HLL': nn.Linear(out_channels, out_channels),  # Temporal flicker
-            'HHH': nn.Linear(out_channels, out_channels),  # High-freq spatial
-            'HLH': nn.Linear(out_channels, out_channels),  # Mixed
-            'LLL': nn.Linear(out_channels, out_channels),  # Smooth baseline
-        })
-        
-    def forward(self, frame_features: torch.Tensor):
+
+    def _apply_freeze(self, freeze_blocks: int) -> None:
+        """Freeze patch embed, pos embed, cls token, and first N blocks."""
+        # Freeze patch embedding
+        for param in self.dinov2.patch_embed.parameters():
+            param.requires_grad = False
+
+        # Freeze cls_token and pos_embed
+        if hasattr(self.dinov2, "cls_token"):
+            self.dinov2.cls_token.requires_grad = False
+        if hasattr(self.dinov2, "pos_embed"):
+            self.dinov2.pos_embed.requires_grad = False
+
+        # Freeze first N blocks
+        for i in range(min(freeze_blocks, len(self.dinov2.blocks))):
+            for param in self.dinov2.blocks[i].parameters():
+                param.requires_grad = False
+
+        # Ensure last blocks are trainable
+        for i in range(freeze_blocks, len(self.dinov2.blocks)):
+            for param in self.dinov2.blocks[i].parameters():
+                param.requires_grad = True
+
+        # Freeze norm layer (part of pretrained representation)
+        if hasattr(self.dinov2, "norm"):
+            for param in self.dinov2.norm.parameters():
+                param.requires_grad = False
+
+    def _count_params(self) -> Tuple[int, int]:
+        """Returns (total_params, trainable_params)."""
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return total, trainable
+
+    def get_param_groups(
+        self, lr_backbone: float = 5e-6
+    ) -> List[Dict]:
         """
+        Returns parameter groups for differential learning rates.
+
         Args:
-            frame_features: (B, T, backbone_dim) per-frame features
-            
+            lr_backbone: Learning rate for fine-tuned blocks (10-11).
+
         Returns:
-            subbands: Dict of sub-band tensors, each (B, out_channels, T/2, 1, 1)
-            all_band_energy: (B,) total energy across all bands
+            List of param group dicts for the optimizer.
+            Frozen params are excluded (they have requires_grad=False).
         """
-        B, T, D = frame_features.shape
-        
-        # Project to working dim
-        x = self.proj(frame_features)  # (B, T, out_channels*4)
-        
-        # Temporal decomposition via Conv1d
-        x_t = x.transpose(1, 2)  # (B, out_channels*4, T)
-        
-        low = self.temporal_low(x_t)    # (B, out_channels, T/2)
-        high = self.temporal_high(x_t)  # (B, out_channels, T/2)
-        
-        T_half = low.shape[2]
-        
-        # Create sub-bands via feature-space projection
-        high_seq = high.transpose(1, 2)  # (B, T/2, out_channels)
-        low_seq = low.transpose(1, 2)
-        
-        subbands = {}
-        for band_name, proj in self.band_projections.items():
-            if band_name.startswith('H'):
-                # High temporal bands come from temporal_high
-                band = proj(high_seq)  # (B, T/2, out_channels)
-            else:
-                # Low temporal bands come from temporal_low
-                band = proj(low_seq)
-            # Reshape to pseudo-5D: (B, out_channels, T/2, 1, 1)
-            subbands[band_name] = band.transpose(1, 2).unsqueeze(-1).unsqueeze(-1)
-        
-        # Compute total band energy for normalization
-        total_energy = torch.zeros(B, device=frame_features.device)
-        for band_tensor in subbands.values():
-            total_energy += band_tensor.reshape(B, -1).norm(dim=1) ** 2
-        all_band_energy = total_energy.sqrt()
-        
-        return subbands, all_band_energy
+        trainable_params = [p for p in self.parameters() if p.requires_grad]
+        if not trainable_params:
+            return []
+        return [{"params": trainable_params, "lr": lr_backbone}]
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Extract CLS tokens from T frames in a single batched pass.
 
-# =====================================================
-# FALLBACK BACKBONE (when timm not available)
-# =====================================================
+        Args:
+            x: (B, T, 3, 224, 224) — batch of T-frame video clips.
 
-class LightweightCNNBackbone(nn.Module):
-    """Fallback when ConvNeXt V2 not available."""
-    
-    def __init__(self, in_channels: int = 3, out_dim: int = 1024):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(in_channels, 64, 7, stride=2, padding=3),
-            nn.BatchNorm2d(64),
-            nn.GELU(),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1),
-            nn.BatchNorm2d(128),
-            nn.GELU(),
-            nn.Conv2d(128, 256, 3, stride=2, padding=1),
-            nn.BatchNorm2d(256),
-            nn.GELU(),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(256, out_dim),
-        )
-    
-    def forward(self, x):
-        return self.features(x)
+        Returns:
+            (B, T, 768) — CLS token per frame.
+        """
+        B, T, C, H, W = x.shape
+
+        # Reshape to process all frames in one pass: (B*T, 3, 224, 224)
+        x_flat = x.reshape(B * T, C, H, W)
+
+        # DINOv2 forward — extract CLS token
+        # forward_features returns the CLS token (first token after norm)
+        cls_tokens = self._extract_cls(x_flat)  # (B*T, 768)
+
+        # Reshape back to temporal sequence: (B, T, 768)
+        cls_tokens = cls_tokens.reshape(B, T, -1)
+
+        return cls_tokens
+
+    def _extract_cls(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Extract CLS token from DINOv2.
+
+        DINOv2's forward_features returns class_token by default.
+        We handle both the standard and non-standard cases.
+
+        Args:
+            x: (N, 3, 224, 224) — batch of images.
+
+        Returns:
+            (N, 768) — CLS tokens.
+        """
+        # Use DINOv2's built-in feature extraction
+        # This runs: patch_embed → pos_embed → blocks → norm → cls_token
+        features = self.dinov2.forward_features(x)
+
+        # DINOv2 returns a dict with 'x_norm_clstoken' key
+        if isinstance(features, dict):
+            return features["x_norm_clstoken"]
+
+        # Fallback: if it returns raw tensor, take the CLS token (index 0)
+        return features[:, 0]
+
+    @torch.no_grad()
+    def set_grad_checkpointing(self, enable: bool = True) -> None:
+        """
+        Enable gradient checkpointing to reduce VRAM usage on T4.
+
+        Trades compute for memory — useful when batch_size=8 + 32 frames
+        approaches the 15GB T4 VRAM limit.
+        """
+        for block in self.dinov2.blocks:
+            block.use_checkpoint = enable
+        state = "enabled" if enable else "disabled"
+        logger.info(f"Gradient checkpointing {state} for DINOv2 blocks")
