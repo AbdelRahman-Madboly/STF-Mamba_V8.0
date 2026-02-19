@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Caches (large, regenerated)
+cache/
+checkpoints/
+*.npz
+
+# Data (too large for git)
+*.mp4
+*.avi
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large docs (optional -- remove if you want them tracked)
+# *.pdf
