@@ -52,6 +52,7 @@ class STFMambaLoss(nn.Module):
             )
 
         self.lambda_var = lambda_var
+        self.margin = 1.5  # Fixed margin for log-variance separation
         self.ce_loss = nn.CrossEntropyLoss(label_smoothing=0.0)
 
     def forward(
@@ -81,18 +82,18 @@ class STFMambaLoss(nn.Module):
         real_mask = (labels == 0)
         fake_mask = (labels == 1)
 
-        # Compute mean variance per class (handle edge cases in batch)
+        # Compute mean log-variance per class
+        loss_var = torch.tensor(0.0, device=logits.device, requires_grad=True)
+        var_gap = torch.tensor(0.0, device=logits.device)
+
         if real_mask.any() and fake_mask.any():
-            var_real = variance_flat[real_mask].mean()
-            var_fake = variance_flat[fake_mask].mean()
-            # L_var = E[σ²|real] - E[σ²|fake]
-            # Minimizing this → push real variance DOWN, fake variance UP
-            loss_var = var_real - var_fake
-            var_gap = (var_fake - var_real).detach()
-        else:
-            # Edge case: batch has only one class — no variance signal
-            loss_var = torch.tensor(0.0, device=logits.device)
-            var_gap = torch.tensor(0.0, device=logits.device)
+            v_real = variance_flat[real_mask].mean()
+            v_fake = variance_flat[fake_mask].mean()
+            
+            # MARGIN LOSS: Only penalize if (v_fake - v_real) < margin
+            # This prevents loss explosion and encourages stable separation
+            loss_var = torch.clamp(self.margin - (v_fake - v_real), min=0.0)
+            var_gap = (v_fake - v_real).detach()
 
         # Total loss
         loss_total = loss_ce + self.lambda_var * loss_var
@@ -100,6 +101,6 @@ class STFMambaLoss(nn.Module):
         return {
             "total": loss_total,
             "ce": loss_ce.detach(),
-            "var": loss_var.detach(),
+            "var": loss_var,  # REMOVED .detach() to ensure grad flow
             "var_gap": var_gap,
         }

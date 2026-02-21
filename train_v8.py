@@ -218,12 +218,11 @@ def train_one_epoch(
             # Forward pass
             outputs = model(videos)
             
-            # Compute loss
+            # Compute loss using the Log-Variance signal
             loss_dict = criterion(
                 logits=outputs['logits'],
                 labels=labels,
-                hll_energy=outputs['hll_energy'],
-                all_band_energy=outputs.get('all_band_energy'),
+                variance=outputs['variance'],
             )
             loss = loss_dict['loss'] / grad_accum_steps
         
@@ -239,13 +238,14 @@ def train_one_epoch(
             optimizer.zero_grad()
         
         # Track metrics
-        total_loss += loss_dict['loss'].item()
-        total_ce += loss_dict['loss_ce'].item()
-        total_hll += loss_dict['loss_hll'].item()
+        total_loss += loss_dict['loss'].item() if 'loss' in loss_dict else loss_dict['total'].item()
+        total_ce += loss_dict['ce'].item()
+        total_hll += loss_dict['var'].item() # Mapping 'var' to the 'hll' column for logging consistency
         
         preds = outputs['logits'].argmax(dim=1)
         total_correct += (preds == labels).sum().item()
         total_samples += labels.size(0)
+        
     
     n_batches = len(train_loader)
     return {
@@ -275,8 +275,7 @@ def validate(model, val_loader, criterion, config, device):
             loss_dict = criterion(
                 logits=outputs['logits'],
                 labels=labels,
-                hll_energy=outputs['hll_energy'],
-                all_band_energy=outputs.get('all_band_energy'),
+                variance=outputs['variance'],
             )
         
         total_loss += loss_dict['loss'].item()
@@ -384,14 +383,11 @@ def main():
         weight_decay=config.weight_decay,
     )
     
-    # Loss
-    criterion = STFV8Loss(
-        hll_weight=config.hll_loss_weight,
-        hll_margin=config.hll_loss_margin,
-        hll_temperature=config.hll_loss_temperature,
-        hll_mode="margin" if config.use_contrastive_hll else "margin",
-        label_smoothing=config.label_smoothing,
-        normalize_hll=config.use_hll_normalization,
+    # Use the updated V8.0 STFMambaLoss with Margin Ranking
+    from stf_mamba.losses import STFMambaLoss
+    criterion = STFMambaLoss(
+        lambda_var=getattr(config, 'lambda_var', 0.5), # Uses config if exists, else 0.5
+        label_smoothing=0.0 # Strict 0.0 for binary classification
     )
     
     # Mixed precision scaler
@@ -475,7 +471,7 @@ def main():
             f"Loss: {train_metrics['train_loss']:.4f} | "
             f"Acc: {train_metrics['train_acc']:.1f}% | "
             f"Val AUC: {val_metrics['val_auc']:.4f} | "
-            f"HLL: {train_metrics['train_hll']:.4f} | "
+            f"VarLoss: {train_metrics['train_hll']:.4f} | "
             f"LR: {current_lr:.2e} | "
             f"Time: {epoch_time:.0f}s | "
             f"{budget.status()}"

@@ -50,7 +50,14 @@ class VarianceConsistencyHead(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
 
-        # Classifier: [mean_pool (512) + variance (1)] → num_classes
+        # Learned projection to find "identity drift" dimensions
+        self.projection = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 4),
+            nn.LeakyReLU(0.1),
+            nn.Linear(embed_dim // 4, embed_dim // 8)
+        )
+
+        # Classifier: [mean_pool (512) + log_variance (1)] → num_classes
         self.classifier = nn.Sequential(
             nn.Dropout(dropout),
             nn.Linear(embed_dim + 1, num_classes),
@@ -67,30 +74,32 @@ class VarianceConsistencyHead(nn.Module):
                 'variance': (B, 1) — temporal identity variance per clip.
                 'similarities': (B, T) — per-frame cosine similarities.
         """
-        # Step 1: Compute sequence mean embedding
-        h_mean = h.mean(dim=1, keepdim=True)  # (B, 1, D)
+        # Step 1: Project to a lower-dimensional drift space
+        # This amplifies subtle flicker that global pooling ignores
+        h_proj = self.projection(h)  # (B, T, D')
 
-        # Step 2: Per-frame cosine similarity to mean
-        # Normalize both for cosine similarity
-        h_norm = F.normalize(h, p=2, dim=-1)           # (B, T, D)
-        h_mean_norm = F.normalize(h_mean, p=2, dim=-1)  # (B, 1, D)
+        # Step 2: Compute Log-Variance for numerical stability
+        # Raw variance of stable features is often < 1e-5
+        # Log-scaling makes the gradient signal visible to AdamW
+        var_per_dim = h_proj.var(dim=1)  # (B, D')
+        log_var = torch.log(var_per_dim + 1e-6).mean(dim=-1, keepdim=True)  # (B, 1)
 
-        # Cosine similarity: dot product of normalized vectors
-        similarities = (h_norm * h_mean_norm).sum(dim=-1)  # (B, T)
-
-        # Step 3: Temporal variance of similarities
-        variance = similarities.var(dim=1, keepdim=True)  # (B, 1)
+        # Step 3: Compute original similarities for logging only
+        with torch.no_grad():
+            h_norm = F.normalize(h, p=2, dim=-1)
+            h_mean_norm = F.normalize(h.mean(dim=1, keepdim=True), p=2, dim=-1)
+            similarities = (h_norm * h_mean_norm).sum(dim=-1)
 
         # Step 4: Concatenate mean-pooled features + variance
-        h_pooled = h.mean(dim=1)  # (B, D) — mean pool over time
-        z = torch.cat([h_pooled, variance], dim=-1)  # (B, D+1)
+        h_pooled = h.mean(dim=1)  # (B, D)
+        z = torch.cat([h_pooled, log_var], dim=-1)  # (B, D+1)
 
         # Step 5: Classify
         logits = self.classifier(z)  # (B, 2)
 
         return {
             "logits": logits,
-            "variance": variance,
+            "variance": log_var,  # Passing log_var to the loss function
             "similarities": similarities,
         }
 

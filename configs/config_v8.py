@@ -121,9 +121,8 @@ class STFV8Config:
     # ==========================================
     # LOSSES
     # ==========================================
-    hll_loss_weight: float = 0.1            # λ for HLL loss
-    hll_loss_margin: float = 1.0            # Margin for contrastive HLL
-    hll_loss_temperature: float = 0.1       # τ for InfoNCE variant
+    lambda_var: float = 0.5                 # Weight for variance auxiliary loss
+    variance_margin: float = 1.5            # Margin for log-variance ranking loss
     
     # ==========================================
     # REGULARIZATION

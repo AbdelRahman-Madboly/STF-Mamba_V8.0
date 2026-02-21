@@ -104,16 +104,17 @@ class STFMambaV8(nn.Module):
         Returns:
             dict with:
                 'logits': (B, 2) — real/fake classification.
-                'variance': (B, 1) — temporal identity variance.
-                'similarities': (B, T) — per-frame cosine similarities.
+                'variance': (B, 1) — Log-scaled temporal identity variance.
+                'similarities': (B, T) — per-frame cosine similarities (for logging).
         """
-        # DINOv2: (B, T, 3, 224, 224) → (B, T, 768)
+        # 1. DINOv2: (B, T, 3, 224, 224) → (B, T, 768)
         cls_tokens = self.backbone(x)
 
-        # Hydra-Mamba: (B, T, 768) → (B, T, 512)
+        # 2. Hydra-Mamba: (B, T, 768) → (B, T, 512)
         temporal_features = self.temporal(cls_tokens)
 
-        # Consistency Head: (B, T, 512) → logits + variance
+        # 3. Consistency Head: (B, T, 512) → logits + log_variance
+        # The updated head now computes variance in a learned projection space.
         output = self.head(temporal_features)
 
         return output
